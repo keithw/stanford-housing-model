@@ -1,0 +1,843 @@
+#!/usr/bin/perl
+
+BEGIN { push @INC, q{.} }
+
+use strict;
+use Date::Parse;
+use POSIX qw{strftime};
+use Number::Format;
+use Carp;
+use Amortization;
+use warnings 'FATAL';
+
+$|=1;
+
+my $money_formatter = new Number::Format( INT_CURR_SYMBOL => q{$} );
+
+sub money ($) {
+  return $money_formatter->format_price( $_[0] );
+}
+
+sub min {
+  my @vals = @_;
+  die unless (scalar @vals > 0);
+  my $min = $vals[ 0 ];
+
+  for ( @vals ) {
+    die unless defined $_ and $_ =~ m{^[-\d\.]+$};
+    if ( $_ < $min ) {
+      $min = $_;
+    }
+  }
+
+  return $min;
+}
+
+sub date2time ($) {
+  my ( $date ) = @_;
+
+  if ( not defined $date ) {
+    carp qq{undefined date};
+    die;
+  }
+
+  unless ( $date =~ m{^20\d\d-\d\d-\d\d$} ) {
+    carp qq{bad date: $date};
+    die;
+  }
+
+  $date .= q{ UTC};
+
+  return str2time $date;
+}
+
+sub time2date ($) {
+  my ( $time ) = @_;
+
+  my $ret = strftime q{%Y-%m-%d}, gmtime $time;
+
+  if ( not defined $ret ) {
+    carp qq{bad time: $time};
+    die;
+  }
+
+  die unless date2time( $ret ) == $time;
+
+  return $ret;
+}
+
+my $beginning_date = q{2021-09-01};
+my $ending_date = q{2051-09-01};
+
+my %person = ( name => "Faculty member + partner",
+	       salary => 11458.33, # x24 => hypothetical $275k combined pre-tax 12-month income. (Stanford has 24 paychecks per year.)
+	       next_hap_after_purchase => 1_250, # x24 => $30k HAP in first year
+	       paychecks_remaining_at_hap_level => -1, # initialized on first use
+	       hap => 0,
+	       hap_delay => 0,
+	       zip_remaining => 100_000,
+	       medical => 400, # tax-exempt health insurance premiums (per paycheck)
+	       nonhome_annual_spending => 100_000, # all nonhome spending per year
+	       balance_posttax => 250_000, # starting balance, post-tax accounts
+	       balance_pretax => 0, # starting balance, pre-tax accounts
+	       taxrecords => { gross_taxable_pay => {},
+			       escrowed_taxes => {},
+			       state_income_tax_paid => {},
+			       state_property_tax_paid => {},
+			       mortgage_interest_paid => {},
+			       points_paid => {},
+			       total_mortgage_balance => {},
+			       days => {} }
+    );
+
+my %house = ( name => "House",
+	      monthly_upkeep => 800,
+	      insurance_annual_premium => 2_400, # house fire+earthquake insurance premium
+	      rgl_fraction => 0.5, # restricted ground lease sale price vs. full cash value
+	      property_purchase_price => 1_720_000,
+	      property_fmv => 0,
+	      property_tax_assessment => 0,
+
+	      map_principal => 0,
+	      map_cumulative_deferred_interest => 0,
+	      map_deferred_interest_accrued_for_period => 0,
+
+	      dip_balance => 0,
+	      rip_balance => 0,
+	      zip_balance => 0,
+	      zip_delay => 0,
+	      appreciation_cap => 1.032, # current rate in ground lease as of 2020-2021
+	      map_current_interest_rate => 0.03,
+	      map_overall_interest_rate => 0.0307, # Long term AFR + 1 percentage point (fixed at month of issue, rate for July 2021), from https://apps.irs.gov/app/picklist/list/federalRates.html
+
+	      sfcu => 1, # external 30-year fixed-rate conventional mortgage (e.g. from Stanford Federal Credit Union)
+	      sfcu_balance => 0,
+	      sfcu_interest_rate => 0.02625,
+	      sfcu_points => 3_465,
+	      sfcu_other_closing_costs => 5196,
+	    );
+
+## Assumptions
+
+my $pretax_savings_per_paycheck = 2 * 19_500 / 24.0; # 401(k) limit per paycheck (two people)
+my $assumed_annual_inflation = 1.02;
+my $assumed_pretax_savings_increase_per_year = 1.02; # Assume IRS 401(k) contribution limit follows inflation
+my $assumed_annual_increase_in_spending = 1.025; # Increase in nonhome spending per year (slightly faster than inflation)
+my $assumed_annual_raise = 1.03;
+my $assumed_medical_inflation = $assumed_annual_raise;
+my $assumed_appreciation_on_savings = 1.06; # assumed 6% raw appreciation on savings (will be diminished by inflation)
+my $assumed_tax_adjustment = $assumed_annual_inflation;
+my $withholding_rate = 0.34;
+my $assumed_housing_appreciation = 1.05; # 5% housing appreciation per year
+my $prop13_assessment_increase_cap = 1.02; # property tax assessment can only increase by this amount per year
+my $property_tax_rate = 0.0118362; # the "main" property tax rate
+my $water_tax_rate = 0.004100 / 100.0; # this portion of the rate not subject to homeowner exemption
+my $property_special_assessments = 901.62; # annual parcel fee
+my $assess_imputed_interest = 0; # For the "Employee Relocation" version of DIP/RIP/ZIP loans given soon after relocation, there is no imputed income or interest
+my $average_short_term_AFR = 0.02; # used for imputed interest -- long-term IRS Applicable Federal Rate
+my $assumed_insurance_increase_rate = $assumed_housing_appreciation;
+
+sub ymd ($) {
+  my ( $date ) = @_;
+  if ( not defined $date ) {
+    carp qq{Undefined date};
+    die;
+  }
+  my ( $year, $month, $day ) = split /-/, $date;
+  return ( $year, $month, $day );
+}
+
+sub inflation_adjust ($$$) {
+  my ( $amount, $actual_date, $asof_date ) = @_;
+
+  my $num_days = ((date2time $actual_date) - (date2time $asof_date)) / 86400;
+
+  die if ( $num_days < 0 );
+
+  my $inflation_rate_per_day = $assumed_annual_inflation ** (1.0 / 365.25);
+
+  return $amount / ($inflation_rate_per_day ** $num_days);
+}
+
+sub pay_interest ($) {
+  my ( $person ) = @_;
+
+  $person->{ balance_posttax } *= ($assumed_appreciation_on_savings ** (1.0 / 365.25));
+  $person->{ balance_pretax } *= ($assumed_appreciation_on_savings ** (1.0 / 365.25));
+}
+
+my @california_single_tax_table = ( [ 0, 0.01 ],
+				    [ 8809, 0.02 ],
+				    [ 20883, 0.04 ],
+				    [ 32960, 0.06 ],
+				    [ 45753, 0.08 ],
+				    [ 57824, 0.093 ],
+				    [ 295373, 0.103 ],
+				    [ 354445, 0.113 ],
+				    [ 590742, 0.123 ],
+				    [ 1000000, 0.133 ] );
+
+my @california_mfj_tax_table = ( [ 0, 0.01 ],
+				 [ 17618, 0.02 ],
+				 [ 41766, 0.04 ],
+				 [ 65920, 0.06 ],
+				 [ 91506, 0.08 ],
+				 [ 115648, 0.093 ],
+				 [ 590746, 0.103 ],
+				 [ 708890, 0.113 ],
+				 [ 1181484, 0.123 ],
+				 [ 2000000, 0.133 ] );
+
+my @federal_single_tax_table = ( [ 0, 0.1 ],
+				 [ 9876, 0.12 ],
+				 [ 40126, 0.22 ],
+				 [ 85526, 0.24 ],
+				 [ 163301, 0.32 ],
+				 [ 207351, 0.35 ],
+				 [ 518401, 0.37 ] );
+
+my @federal_mfj_tax_table = ( [ 0, 0.1 ],
+			      [ 19751, 0.12 ],
+			      [ 80251, 0.22 ],
+			      [ 171051, 0.24 ],
+			      [ 326601, 0.32 ],
+			      [ 414701, 0.35 ],
+			      [ 622051, 0.37 ] );
+
+my $social_security_cutoff = 142_800;
+my $social_security_tax_rate_below_cutoff = 0.062;
+
+my $medicare_cutoff_single = 200_000; # single filers
+my $medicare_cutoff_mfj = 250_000; # married filing jointly
+my $medicare_tax_rate_below_cutoff = 0.0145;
+my $medicare_tax_rate_above_cutoff = 0.009;
+
+sub print_tax_table {
+  my @tax_table = @_;
+
+  for ( @tax_table ) {
+    printf qq{Income above %s is taxed at %.1f%%\n}, money( $_->[ 0 ] ), 100 * $_->[ 1 ];
+  }
+}
+
+sub apply_tax_table ($$) {
+  my ( $val, $tableref ) = @_;
+
+  my @table = @{ $tableref };
+
+  my $tax;
+
+  LEVEL: for ( my $level = 0; $level <= $#table; $level++ ) {
+    my $lower_limit = $table[ $level ]->[ 0 ];
+    my $upper_limit;
+    if ( $level == $#table ) {
+      $upper_limit = 1e10;
+    } else {
+      $upper_limit = $table[ $level + 1 ]->[ 0 ];
+    }
+
+    my $rate = $table[ $level ]->[ 1 ];
+
+
+    if ( $val <= $lower_limit ) {
+      last LEVEL;
+    }
+
+    my $value_at_this_level = min( $val - $lower_limit, $upper_limit - $lower_limit );
+    $tax += $value_at_this_level * $rate;
+  }
+
+  return $tax;
+}
+
+sub hap_duration_at_level ($) {
+  my ( $time ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  die if ( $year < 2017 );
+  die if ( $year > 2050 );
+
+  if ( ($year == 2019 and $month >= 9)
+     or ($year == 2020 and $month < 9) ) {
+    return 48;
+  } else {
+    return 24;
+  }
+}
+
+sub purchase_property ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  printf STDERR qq{Purchasing property on $year-$month-$day\n};
+
+  $property->{ property_purchase_date } = time2date $time;
+  $property->{ property_fmv_at_purchase } = $property->{ property_purchase_price } / $property->{ rgl_fraction };
+  die if $person->{ hap } > 0;
+  $person->{ hap } = $person->{ next_hap_after_purchase };
+  $person->{ hap_delay } = 1;
+  if ( $person->{ paychecks_remaining_at_hap_level } < 0 ) {
+    # new HAP
+    $person->{ paychecks_remaining_at_hap_level } = hap_duration_at_level( $time );
+  }
+
+  $property->{ property_fmv } = $property->{ property_fmv_at_purchase };
+  $property->{ property_tax_assessment } = $property->{ property_fmv_at_purchase };
+
+  if ( $year < 2017 or ($year == 2017 and $month < 12) ) {
+    $person->{ deductible_mortgage_limit } = 1_000_000;
+  } else {
+    $person->{ deductible_mortgage_limit } = 750_000;
+  }
+
+  printf STDERR qq{Mortgage principal limit for deductibility: %s\n}, money( $person->{ deductible_mortgage_limit } );
+
+  my $purchase_price = $property->{ property_fmv } * $property->{ rgl_fraction };
+  printf STDERR qq{Purchase price: %s\n}, money( $purchase_price );
+
+  my $map = min( 0.6 * $purchase_price, 700_000 );
+  my $dip = min( 0.2 * $purchase_price, 250_000 );
+  my $required_down_payment = 0.1 * $purchase_price;
+  my $rip = min( $purchase_price - $map - $dip - $required_down_payment, 300_000 );
+  my $zip = min( $purchase_price - $map - $dip - $rip - $required_down_payment, $person->{ zip_remaining } );
+
+  if ( $month >= 7 ) {
+    $property->{ zip_delay } = 1;
+  }
+
+  my $sfcu = $property->{ sfcu } ? ( $purchase_price - $map - $dip - $rip - $zip - $required_down_payment ) : 0;
+
+  if ( $property->{ sfcu } ) {
+    $property->{ sfcu_next_payment_number } = 1;
+    $property->{ sfcu_amortization } = new Finance::Amortization( principal => $sfcu,
+							       rate => $property->{ sfcu_interest_rate },
+							       periods => 12 * 30 );
+  }
+
+  printf STDERR qq{MAP: %s, DIP: %s, RIP: %s, ZIP: %s, SFCU: %s\n},
+    money( $map ),
+    money( $dip ),
+    money( $rip ),
+    money( $zip ),
+    money( $sfcu );
+
+  die if $property->{ map_principal } > 0;
+  die if $property->{ dip_balance } > 0;
+  die if $property->{ rip_balance } > 0;
+  die if $property->{ zip_balance } > 0;
+
+  $property->{ map_principal } += $map;
+  $property->{ dip_balance } += $dip;
+  $property->{ rip_balance } += $rip;
+  $property->{ zip_balance } += $zip;
+
+  if ( $property->{ sfcu } ) {
+    die if $property->{ sfcu_balance } > 0;
+    $property->{ sfcu_balance } += $sfcu;
+  }
+
+  my $loan_points = ($map + $dip + $rip + $zip) * 0.01 + ( $property->{ sfcu } ? $property->{ sfcu_points } : 0 );
+  $person->{ taxrecords }{ points_paid }{ $year } = $loan_points;
+
+  my $payment_at_close = $purchase_price + $loan_points
+    + ( $property->{ sfcu } ? $property->{ sfcu_other_closing_costs } : 0 )
+    - $map - $dip - $rip - $zip - $sfcu;
+  printf STDERR qq{Payment at close: %s\n}, money( $payment_at_close );
+
+  $person->{ balance_posttax } -= $payment_at_close;
+}
+
+sub sell_property ($$$$) {
+  my ( $time, $person, $property, $known_sale_price ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  my $days_of_ownership = ($time - (date2time $property->{ property_purchase_date })) / 86400.0;
+
+  if ( $days_of_ownership > 30 * 365.25 ) {
+    die qq{Property held beyond life of DIP/RIP loans -- this simulation does not include repayment/refinancing of these 30-year Stanford loans};
+  }
+
+  my $fmv_cap = $property->{ property_fmv_at_purchase } * $property->{ appreciation_cap } ** ($days_of_ownership / 365.25);
+  my $sale_price = min( $property->{ property_fmv }, $fmv_cap ) * $property->{ rgl_fraction };
+  if ( defined $known_sale_price ) {
+      die if $sale_price < $known_sale_price;
+      $sale_price = $known_sale_price;
+  }
+  my $appreciation = $sale_price - $property->{ property_purchase_price };
+  my $map_share_of_appreciation = ($property->{ map_principal } / $property->{ property_purchase_price }) * $appreciation;
+
+  printf STDERR qq{Selling property on %s after %d days, with FMV %s, FMV cap %s, sale price %s\n},
+    time2date $_[ 0 ],
+    $days_of_ownership,
+    money( $property->{ property_fmv } ), money( $fmv_cap ), money( $sale_price );
+
+  printf STDERR qq{MAP deferred interest due: %s\n}, money( $property->{ map_cumulative_deferred_interest } + $property->{ map_deferred_interest_accrued_for_period } );
+  printf STDERR qq{MAP share of appreciation: %s\n}, money( $map_share_of_appreciation );
+
+  printf STDERR qq{MAP deferred interest / current interest: %s / %s\n}, money( $property->{ map_cumulative_deferred_interest } ), money( $property->{ map_deferred_interest_accrued_for_period } );
+
+  my $sale_proceeds = $sale_price;
+
+  # pay back MAP
+  $sale_proceeds -= $property->{ map_principal };
+
+  printf STDERR qq{Pay MAP principal: %s\n}, money( $property->{ map_principal } );
+
+  printf STDERR qq{Appreciation: %s\n}, money( $appreciation );
+
+  if ( $appreciation > 0 ) {
+    my $interest_due = min( $map_share_of_appreciation, $property->{ map_cumulative_deferred_interest } + $property->{ map_deferred_interest_accrued_for_period } );
+    $sale_proceeds -= $interest_due;
+
+    printf STDERR qq{Pay MAP appreciation: %s\n}, money( $interest_due );
+
+    $person->{ taxrecords }{ mortgage_interest_paid }{ $year } += $interest_due;
+  }
+
+  $property->{ map_principal } = 0;
+  $property->{ map_cumulative_deferred_interest } = 0;
+  $property->{ map_deferred_interest_accrued_for_period } = 0;
+
+  # pay back DIP
+  $sale_proceeds -= $property->{ dip_balance };
+
+  printf  STDERR qq{Pay DIP balance: %s\n}, money( $property->{ dip_balance } );
+
+  if ( $appreciation > 0 ) {
+    my $interest_due = ( $property->{ dip_balance } / $property->{ property_purchase_price } ) * $appreciation;
+    $sale_proceeds -= $interest_due;
+    printf STDERR qq{Pay DIP appreciation: %s\n}, money( $interest_due );
+
+    $person->{ taxrecords }{ mortgage_interest_paid }{ $year } += $interest_due;
+  }
+  $property->{ dip_balance } = 0;
+
+  # pay back RIP
+  $sale_proceeds -= $property->{ rip_balance };
+  printf STDERR qq{Pay RIP balance: %s\n}, money( $property->{ rip_balance } );
+  $property->{ rip_balance } = 0;
+
+  # pay back ZIP
+  $sale_proceeds -= $property->{ zip_balance };
+  printf STDERR qq{Pay ZIP balance: %s\n}, money( $property->{ zip_balance } );
+  $property->{ zip_balance } = 0;
+
+  # pay back SFCU
+  if ( $property->{ sfcu } ) {
+    printf STDERR qq{Paying remaining SFCU balance of %s\n}, money( $property->{ sfcu_balance } );
+    $sale_proceeds -= $property->{ sfcu_balance };
+    $property->{ sfcu_balance } = 0;
+  }
+
+  printf STDERR qq{Remaining proceeds of sale: %s\n}, money( $sale_proceeds );
+  $person->{ balance_posttax } += $sale_proceeds;
+
+  $property->{ property_fmv } = 0;
+  $property->{ property_tax_assessment } = 0;
+
+  $person->{ hap } = 0;
+}
+
+sub apply_global_increases ($) {
+  my ( $time ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $month == 1 and $day == 1 ) {
+    $pretax_savings_per_paycheck *= $assumed_pretax_savings_increase_per_year;
+
+    if ( $year > 2021 ) {
+      for ( @california_single_tax_table ) {
+	$_->[ 0 ] *= $assumed_tax_adjustment;
+      }
+
+      for ( @federal_single_tax_table ) {
+	$_->[ 0 ] *= $assumed_tax_adjustment;
+      }
+
+      for ( @california_mfj_tax_table ) {
+	$_->[ 0 ] *= $assumed_tax_adjustment;
+      }
+
+      for ( @federal_mfj_tax_table ) {
+	$_->[ 0 ] *= $assumed_tax_adjustment;
+      }
+
+      $social_security_cutoff *= $assumed_tax_adjustment;
+      $medicare_cutoff_single *= $assumed_tax_adjustment;
+      $medicare_cutoff_mfj *= $assumed_tax_adjustment;
+    }
+  }
+
+  if ( $month == 10 and $day == 1 ) {
+    $property_special_assessments *= $assumed_tax_adjustment;
+  }
+}
+
+sub apply_property_increases ($$) {
+  my ( $time, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  $property->{ property_fmv } *= ($assumed_housing_appreciation ** (1.0 / 365.25));
+
+  if ( $month == 1 and $day == 1 ) {
+    if ( $year > 2021 ) {
+      $property->{ monthly_upkeep } *= $assumed_annual_inflation;
+      $property->{ insurance_annual_premium } *= $assumed_insurance_increase_rate;
+    }
+  }
+
+  if ( $month == 10 and $day == 1 ) {
+    $property->{ property_tax_assessment } *= $prop13_assessment_increase_cap;
+  }
+}
+
+sub apply_personal_increases ($$) {
+  my ( $time, $person ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $month == 1 and $day == 1 ) {
+    $person->{ nonhome_annual_spending } *= $assumed_annual_increase_in_spending;
+    $person->{ medical } *= $assumed_medical_inflation;
+  }
+}
+
+sub adjust_salary ($$) {
+  my ( $time, $person ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $month == 10 and $day == 20 ) {
+    $person->{ salary } *= $assumed_annual_raise; # model 4% raise per year
+  }
+}
+
+sub pay_person ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $day == 5 or $day == 20 ) {
+    my $gross = $person->{ salary };
+
+#    printf qq{%s paying %s %s (salary)}, time2date $time, $person->{ name }, money( $person->{ salary } );
+
+    if ( $person->{ hap_delay } ) {
+      $person->{ hap_delay } = 0;
+    } else {
+      $gross += $person->{ hap };
+
+#      printf qq{Paying %s %s + %s\n}, money( $person->{ salary } ), money( $person->{ hap } );
+
+      # decrease HAP?
+      if ( $person->{ hap } > 0 ) {
+#	  printf qq{ + %s (HAP)}, money( $person->{ hap } );
+
+	  die unless $person->{ next_hap_after_purchase } == $person->{ hap };
+
+	$person->{ paychecks_remaining_at_hap_level }--;
+	if ( $person->{ paychecks_remaining_at_hap_level } == 0 ) {
+	  $person->{ hap } -= 1_250 / 9.0;
+	  $person->{ paychecks_remaining_at_hap_level } = hap_duration_at_level( $time );
+	  $person->{ next_hap_after_purchase } = $person->{ hap };
+
+	  if ( $person->{ hap } < 0 ) {
+	    $person->{ hap } = 0;
+	  }
+	}
+      }
+    }
+
+#    printf qq{\n};
+
+    if ( $gross < $pretax_savings_per_paycheck ) {
+      die;
+    }
+
+    if ( $month == 12 and $day == 5 ) {
+      if ( $property->{ zip_delay } ) { # ZIP loan originated July or later
+	$property->{ zip_delay } = 0;
+      } elsif ( $property->{ zip_balance } > 0 ) {
+	$property->{ zip_balance } -= 10_000;
+	$person->{ zip_remaining } -= 10_000;
+	$gross += 10_000;
+      }
+
+      die if $property->{ zip_balance } < 0;
+    }
+
+    my $remaining_gross = $gross;
+
+    $remaining_gross -= $pretax_savings_per_paycheck;
+    $person->{ balance_pretax } += $pretax_savings_per_paycheck;
+
+    $remaining_gross -= $person->{ medical };
+
+    # end pretax deductions
+    $person->{ taxrecords }{ gross_taxable_pay }{ $year } += $remaining_gross;
+
+    my $taxes_withheld = $withholding_rate * $remaining_gross;
+    $remaining_gross -= $taxes_withheld;
+    $person->{ taxrecords }{ escrowed_taxes }{ $year } += $taxes_withheld;
+
+    $person->{ balance_posttax } += $remaining_gross;
+  }
+}
+
+sub pay_mortgage ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  my ( $yp, $mp, $dp ) = ymd $property->{ property_purchase_date };
+
+  # record mortgage stats
+  $person->{ taxrecords }{ total_mortgage_balance }{ $year } += $property->{ map_principal } + $property->{ dip_balance } + $property->{ rip_balance } + $property->{ zip_balance };
+  $person->{ taxrecords }{ days }{ $year }++;
+
+  # compound MAP interest
+  if ( $month == $mp and $day == $dp ) {
+    $property->{ map_cumulative_deferred_interest } += $property->{ map_deferred_interest_accrued_for_period };
+    $property->{ map_deferred_interest_accrued_for_period } = 0;
+    printf STDERR qq{%s DIAFP to zero, compounded MAP now %s\n}, time2date $time,
+      money( $property->{ map_principal } + $property->{ map_cumulative_deferred_interest }  );
+  }
+
+  # accrue overall interest
+  $property->{ map_deferred_interest_accrued_for_period } += ($property->{ map_principal } + $property->{ map_cumulative_deferred_interest }) * ($property->{ map_overall_interest_rate } / 365.25);
+#  printf qq{%s MAP DIAFP up to %s\n}, time2date $time,
+#    money( $property->{ map_deferred_interest_accrued_for_period } );
+
+  # pay present interest on MAP
+  if ( $day == 5 or $day == 20 ) {
+    my $interest_due = $property->{ map_principal } * $property->{ map_current_interest_rate } / 24;
+    $person->{ balance_posttax } -= $interest_due;
+    $person->{ taxrecords }{ mortgage_interest_paid }{ $year } += $interest_due;
+    $property->{ map_deferred_interest_accrued_for_period } -= $interest_due;
+
+#    printf qq{%s interest_due = %s, MAP DIAFP down to %s\n}, time2date $time,
+#      money( $interest_due ),
+#      money( $property->{ map_deferred_interest_accrued_for_period } );
+  }
+
+  # pay interest and principal on SFCU
+  if ( $property->{ sfcu } and $day == 17 ) {
+    my $payment_due = $property->{ sfcu_amortization }->payment();
+#    printf STDERR qq{SFCU payment: %s\n}, money( $payment_due );
+    my $interest_portion = $property->{ sfcu_amortization }->interest( $property->{ sfcu_next_payment_number } );
+    ++$property->{ sfcu_next_payment_number };
+    my $principal_portion = $payment_due - $interest_portion;
+
+    $person->{ balance_posttax } -= $payment_due;
+    $person->{ taxrecords }{ mortgage_interest_paid }{ $year } += $interest_portion;
+    $property->{ sfcu_balance } -= $principal_portion;
+
+#    printf STDERR qq{Principal paid on SFCU loan: %s, balance now %s\n}, money( $principal_portion ), money( $property->{ sfcu_balance } );
+  }
+
+  # imputed interest
+  if ( $assess_imputed_interest ) {
+    $person->{ taxrecords }{ gross_taxable_pay }{ $year } += ($property->{ dip_balance } + $property->{ rip_balance } + $property->{ zip_balance }) * $average_short_term_AFR / 365.25;
+    $person->{ taxrecords }{ mortgage_interest_paid }{ $year } += ($property->{ dip_balance } + $property->{ rip_balance } + $property->{ zip_balance }) * $average_short_term_AFR / 365.25;
+  }
+}
+
+sub daily_expenses ($) {
+  my ( $person ) = @_;
+  $person->{ balance_posttax } -= $person->{ nonhome_annual_spending } / 365.25;
+}
+
+sub pay_taxes ($$$$$$) {
+  my ( $time, $person, $fed_taxref, $state_taxref, $medicare_cutoff, $person2 ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  my $tax_year = $year - 1;
+
+  if ( $month == 4 and $day == 15 ) {
+    # step 0: transfer tax records
+    if ( defined $person2 ) {
+      printf STDERR qq{Transfering tax records from %s to %s\n}, $person2->{ name }, $person->{ name };
+
+      for ( keys %{ $person2->{ taxrecords } } ) {
+	my $other_val = (defined $person2->{ taxrecords }{ $_ }{ $tax_year }) ? $person2->{ taxrecords }{ $_ }{ $tax_year } : 0;
+	$person->{ taxrecords }{ $_ }{ $tax_year } += $other_val;
+	$person2->{ taxrecords }{ $_ }{ $tax_year } = 0;
+      }
+    }
+
+    printf STDERR qq{Paying taxes for %d for %s\n}, $tax_year, $person->{ name } . ((defined $person2) ? qq{ + $person2->{ name }} : q{});
+    printf STDERR qq{Gross taxable pay in %4d: %s\n}, $tax_year, money( $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year } );
+    printf STDERR qq{Escrowed taxes for %4d: %s\n}, $tax_year, money( $person->{ taxrecords }{ escrowed_taxes }{ $tax_year } );
+
+    # step 1: calculate taxable income
+    my $total_income = $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year };
+    my $agi = $total_income;
+
+    # step 2: deductions
+    my $state_income_tax = $person->{ taxrecords }{ state_income_tax_paid }{ $tax_year };
+    $state_income_tax = 0 if not defined $state_income_tax;
+    my $state_property_tax = $person->{ taxrecords }{ state_property_tax_paid }{ $tax_year };
+    $state_property_tax = 0 if not defined $state_property_tax;
+
+    my $mortgage_interest_paid = $person->{ taxrecords }{ mortgage_interest_paid }{ $tax_year };
+    $mortgage_interest_paid = 0 if not defined $mortgage_interest_paid;
+
+    if ( $mortgage_interest_paid > 0 ) {
+      my $indebtedness = $person->{ taxrecords }{ total_mortgage_balance }{ $tax_year } / $person->{ taxrecords }{ days }{ $tax_year };
+
+      if ( $indebtedness > $person->{ deductible_mortgage_limit } ) {
+	$mortgage_interest_paid *= ( $person->{ deductible_mortgage_limit } / $indebtedness );
+      }
+    }
+
+    my $deductible_points = 0;
+    if ( defined $person->{ taxrecords }{ points_paid }{ $tax_year } ) {
+      $deductible_points = $person->{ taxrecords }{ points_paid }{ $tax_year };
+    }
+
+#    printf qq{Mortgage interest paid: %s\n}, money( $mortgage_interest_paid );
+#    printf qq{Points: %s\n}, money( $deductible_points );
+
+    my $federal_salt_deduction = min( 10_000, $state_income_tax + $state_property_tax );
+    my $federal_taxable_income = $agi - $federal_salt_deduction - $mortgage_interest_paid - $deductible_points;
+    my $state_taxable_income = $agi - $state_property_tax - $mortgage_interest_paid - $deductible_points;
+
+    # step 3: calculate tax owed
+    my $federal_tax = apply_tax_table( $federal_taxable_income, $fed_taxref );
+    my $state_tax = apply_tax_table( $state_taxable_income, $state_taxref );
+    my $social_security_tax = min( $social_security_cutoff, $agi ) * $social_security_tax_rate_below_cutoff;
+    my $medicare_tax = min( $medicare_cutoff, $agi ) * $medicare_tax_rate_below_cutoff;
+    if ( $agi > $medicare_cutoff ) {
+      $medicare_tax += ( $agi - $medicare_cutoff ) * $medicare_tax_rate_above_cutoff;
+    }
+
+    my $total_tax = $federal_tax + $state_tax + $social_security_tax + $medicare_tax;
+
+#    printf qq{Total tax: %s %s %s %s\n},
+#      money( $federal_tax ),
+#      money( $state_tax ),
+#      money( $social_security_tax ),
+#      money( $medicare_tax );
+
+    my $tax_owed = $total_tax - $person->{ taxrecords }{ escrowed_taxes }{ $tax_year };
+
+    $person->{ taxrecords }{ state_income_tax_paid }{ $year } = $state_tax;
+
+    if ( $tax_owed > 0 ) {
+#      printf qq{Tax bill on %s, withheld %s, owed %s\n}, money( $total_tax ), money( $escrowed_taxes{ $tax_year } ), money( $tax_owed );
+
+      $person->{ balance_posttax } -= $tax_owed;
+      $person->{ taxrecords }{ escrowed_taxes }{ $tax_year } = 0;
+    } else {
+      # refund due
+      my $refund = -$tax_owed;
+
+      $person->{ balance_posttax } += $refund;
+      $person->{ taxrecords }{ escrowed_taxes }{ $tax_year } = 0;
+
+#      printf qq{Tax refund on %s, withhold %s, refund %s\n}, money( $total_tax ), money( $escrowed_taxes{ $tax_year } ), money( $refund );
+    }
+  }
+}
+
+sub pay_monthly_upkeep ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $day == 1 ) {
+    $person->{ balance_posttax } -= $property->{ monthly_upkeep };
+  }
+}
+
+sub pay_insurance ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  my ( $yp, $mp, $dp ) = ymd $property->{ property_purchase_date };
+
+  if ( $mp == $month and $dp == $day ) {
+    $person->{ balance_posttax } -= $property->{ insurance_annual_premium };
+  }
+}
+
+sub pay_property_taxes ($$$) {
+  my ( $time, $person, $property ) = @_;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  if ( $property->{ property_tax_assessment } <= 0 ) {
+    $person->{ taxrecords }{ state_property_tax_paid }{ $year } += 0;
+    return; # no special assessments either
+  }
+
+  if ( ($month == 12 and $day == 10)
+       or ($month == 4 and $day == 10) ) {
+    my $annual_tax_bill = ($property->{ property_tax_assessment } - 7000) * $property_tax_rate
+      + $property->{ property_tax_assessment } * $water_tax_rate
+      + $property_special_assessments;
+    my $this_tax_bill = $annual_tax_bill / 2;
+
+    $person->{ balance_posttax } -= $this_tax_bill;
+    $person->{ taxrecords }{ state_property_tax_paid }{ $year } += $this_tax_bill;
+
+    printf STDERR qq{%s: paying property tax bill of %s on assessed value of %s\n}, time2date $_[ 0 ], money( $this_tax_bill ), money( $property->{ property_tax_assessment } );
+  }
+}
+
+for ( my $time = date2time $beginning_date;
+      $time <= date2time $ending_date;
+      $time += 86400 ) {
+  my $date = time2date $time;
+  my ( $year, $month, $day ) = ymd time2date $time;
+
+  apply_global_increases( $time );
+  adjust_salary( $time, \%person );
+
+  apply_personal_increases( $time, \%person );
+  pay_interest( \%person );
+  pay_person( $time, \%person, \%house );
+  pay_taxes( $time, \%person, \@federal_mfj_tax_table, \@california_mfj_tax_table, $medicare_cutoff_mfj, undef );
+  daily_expenses( \%person );
+
+  # handle house
+  if ( $date eq q{2021-09-01} ) {
+    purchase_property( $time, \%person, \%house );
+  }
+
+  if ( $time >= date2time q{2021-09-01}
+       and $time <= date2time $ending_date ) {
+    apply_property_increases( $time, \%house );
+    pay_property_taxes( $time, \%person, \%house );
+    pay_mortgage( $time, \%person, \%house );
+    pay_monthly_upkeep( $time, \%person, \%house );
+    pay_insurance( $time, \%person, \%house );
+  }
+
+  if ( $date eq $ending_date ) {
+    sell_property( $time, \%person, \%house, undef );
+  }
+
+  printf qq{%s Total pre-tax + post-tax money in %s dollars: %s + %s\n},
+    $date,
+    time2date date2time $beginning_date,
+    inflation_adjust( $person{ balance_pretax }, $date, $beginning_date ),
+    inflation_adjust( $person{ balance_posttax }, $date, $beginning_date );
+}
+
+printf qq{%s Total_final pre-tax + post-tax money in %s dollars: %s + %s\n},
+  time2date (86400 * 365 * 10 + (date2time $ending_date)), # extend "final" data point for prettier display in graph
+  time2date date2time $beginning_date,
+  inflation_adjust( $person{ balance_pretax }, $ending_date, $beginning_date ),
+  inflation_adjust( $person{ balance_posttax }, $ending_date, $beginning_date );
+
+# verify_all_taxes_paid
+
+for my $person ( \%person ) {
+  my %escrowed_taxes = %{ $person->{ taxrecords }{ escrowed_taxes } };
+  for ( sort { $a <=> $b } keys %escrowed_taxes ) {
+    if ( $escrowed_taxes{ $_ } != 0 ) {
+      printf qq{Warning: taxes not paid for year %4d\n}, $_;
+    }
+  }
+}
+
+printf STDERR qq{Ending balance as of %s in %s dollars:\n\t%s pretax, %s post-tax\n},
+  time2date date2time $ending_date,
+  time2date date2time $beginning_date,
+  money( inflation_adjust( $person{ balance_pretax }, $ending_date, $beginning_date ) ),
+  money( inflation_adjust( $person{ balance_posttax }, $ending_date, $beginning_date ) );
