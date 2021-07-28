@@ -81,6 +81,7 @@ my %person = ( name => "Faculty member + partner",
 	       balance_posttax => 250_000, # starting balance, post-tax accounts
 	       balance_pretax => 0, # starting balance, pre-tax accounts
 	       taxrecords => { gross_taxable_pay => {},
+			       raw_payroll => {},
 			       escrowed_taxes => {},
 			       state_income_tax_paid => {},
 			       state_property_tax_paid => {},
@@ -563,8 +564,9 @@ sub pay_person ($$$) {
       die if $property->{ zip_balance } < 0;
     }
 
-    my $remaining_gross = $gross;
+    $person->{ taxrecords }{ raw_payroll }{ $year } += $gross;
 
+    my $remaining_gross = $gross;
     $remaining_gross -= $pretax_savings_per_paycheck;
     $person->{ balance_pretax } += $pretax_savings_per_paycheck;
 
@@ -588,7 +590,7 @@ sub pay_mortgage ($$$) {
   my ( $yp, $mp, $dp ) = ymd $property->{ property_purchase_date };
 
   # record mortgage stats
-  $person->{ taxrecords }{ total_mortgage_balance }{ $year } += $property->{ map_principal } + $property->{ dip_balance } + $property->{ rip_balance } + $property->{ zip_balance };
+  $person->{ taxrecords }{ total_mortgage_balance }{ $year } += $property->{ map_principal } + $property->{ dip_balance } + $property->{ rip_balance } + $property->{ zip_balance } + $property->{ sfcu_balance };
   $person->{ taxrecords }{ days }{ $year }++;
 
   # compound MAP interest
@@ -662,12 +664,13 @@ sub pay_taxes ($$$$$$) {
     }
 
     printf STDERR qq{Paying taxes for %d for %s\n}, $tax_year, $person->{ name } . ((defined $person2) ? qq{ + $person2->{ name }} : q{});
-    printf STDERR qq{Gross taxable pay in %4d: %s\n}, $tax_year, money( $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year } );
+    printf STDERR qq{AGI in %4d: %s (raw payroll was %s)\n}, $tax_year,
+      money( $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year } ), money( $person->{ taxrecords }{ raw_payroll }{ $tax_year } );
     printf STDERR qq{Escrowed taxes for %4d: %s\n}, $tax_year, money( $person->{ taxrecords }{ escrowed_taxes }{ $tax_year } );
 
     # step 1: calculate taxable income
-    my $total_income = $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year };
-    my $agi = $total_income;
+    my $agi = $person->{ taxrecords }{ gross_taxable_pay }{ $tax_year };
+    my $gross = $person->{ taxrecords }{ raw_payroll }{ $tax_year };
 
     # step 2: deductions
     my $state_income_tax = $person->{ taxrecords }{ state_income_tax_paid }{ $tax_year };
@@ -684,6 +687,30 @@ sub pay_taxes ($$$$$$) {
       if ( $indebtedness > $person->{ deductible_mortgage_limit } ) {
 	$mortgage_interest_paid *= ( $person->{ deductible_mortgage_limit } / $indebtedness );
       }
+
+      # IRS publication 936 (Table 1) specifies a method where you put
+      # down $750,000 as the numerator, and "the average balance of
+      # all your home acquisition debt" as the denominator, and the
+      # resulting fraction then multiplies "the total amount of
+      # interest that you paid on the loans" to produce the deductible
+      # home mortgage interest. That is the method used here.
+
+      # The actual tax code (26 U.S.C. § 163(h)(3)(B)(ii),
+      # (h)(3)(F)(i)) is more ambiguous, and just says that the
+      # "aggregate amount treated as acquisition indebtedness for any
+      # period shall not exceed" $750,000.
+
+      # That seems to leave the question: could you elect to "treat"
+      # only your interest-bearing loan(s) [or, your highest
+      # interest-bearing loans] as "acquisition indebtedness", since
+      # you'll only be trying to deduct the interest on those loans
+      # anyway? That would be an advantageous move (compared with the
+      # IRS publication's pro-rata rule), especially for recent
+      # transplants will have up to $650,000 in interest-free Employee
+      # Relocation loans from Stanford (DIP/RIP/ZIP). If you (or your
+      # tax preparer) feel comfortable with this alternate
+      # interpretation, you could change the behavior of this script
+      # to reflect the smaller tax bill.
     }
 
     my $deductible_points = 0;
@@ -701,10 +728,10 @@ sub pay_taxes ($$$$$$) {
     # step 3: calculate tax owed
     my $federal_tax = apply_tax_table( $federal_taxable_income, $fed_taxref );
     my $state_tax = apply_tax_table( $state_taxable_income, $state_taxref );
-    my $social_security_tax = min( $social_security_cutoff, $agi ) * $social_security_tax_rate_below_cutoff;
-    my $medicare_tax = min( $medicare_cutoff, $agi ) * $medicare_tax_rate_below_cutoff;
-    if ( $agi > $medicare_cutoff ) {
-      $medicare_tax += ( $agi - $medicare_cutoff ) * $medicare_tax_rate_above_cutoff;
+    my $social_security_tax = min( $social_security_cutoff, $gross ) * $social_security_tax_rate_below_cutoff;
+    my $medicare_tax = min( $medicare_cutoff, $gross ) * $medicare_tax_rate_below_cutoff;
+    if ( $gross > $medicare_cutoff ) {
+      $medicare_tax += ( $gross - $medicare_cutoff ) * $medicare_tax_rate_above_cutoff;
     }
 
     my $total_tax = $federal_tax + $state_tax + $social_security_tax + $medicare_tax;
